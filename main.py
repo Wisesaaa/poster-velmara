@@ -3,53 +3,177 @@
 
 Writes /output/entry.png (1024x1024, PNG, < 1 MiB).
 
+PURE PYTHON STANDARD LIBRARY ONLY. The grader image is vanilla
+python:3.13-slim: it ships no Pillow, no image libraries, no network.
+So this program draws on a raw RGB pixel buffer and encodes the PNG
+itself (zlib + struct + binascii, all stdlib). The display type is a
+hand-set 5x7 bitmap font, scaled up — no font file needed.
+
 Design philosophy "Moonlit Tide" (canvas-design method):
-- One landmark, one promise: a natural stone arch framing a low golden moon
-  over a calm sea, a single sailboat on the moon's light path. The stay it
-  promises is a quiet night on a warm, moonlit coast.
+- One landmark, one promise: a low golden moon over a calm sea, a single
+  sailboat on the moon's light path. The stay it promises is a quiet night
+  on a warm, moonlit coast.
 - Limited palette: deep indigo sky, violet dusk, teal sea, pale gold moon.
-- The name VELMARA is set large, legible, centred in the upper sky — the only
-  text on the poster. No quotes, no stars, no other copy.
-- Everything is drawn procedurally with Pillow; no network, no downloaded
-  assets. The display font is bundled in this repo (SIL OFL).
+- The name VELMARA is set large, legible, centred in the upper sky — the
+  only text on the poster. No quotes, no stars, no other copy.
 """
+import binascii
 import math
 import os
 import random
-
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+import struct
+import zlib
 
 W = H = 1024
 OUT = os.environ.get("OUTPUT_PATH", "/output/entry.png")
 
-# --- palette (limited, purposeful) ---
-INK      = (12, 10, 30)      # deep indigo night
-SKY_TOP  = (16, 14, 48)
-SKY_MID  = (58, 38, 96)
-DUSK     = (146, 74, 110)    # violet dusk band
-EMBER    = (232, 138, 74)    # warm ember at the horizon
+INK = (12, 10, 30)
+SKY_TOP = (16, 14, 48)
+SKY_MID = (58, 38, 96)
+DUSK = (146, 74, 110)
+EMBER = (232, 138, 74)
 SEA_DEEP = (10, 42, 58)
-SEA_LIT  = (24, 84, 96)
-MOON     = (250, 222, 158)   # pale gold moon
+SEA_LIT = (24, 84, 96)
+MOON = (250, 222, 158)
 MOON_CORE = (255, 244, 214)
-CREAM    = (250, 238, 214)   # name type
-ARCH     = (14, 12, 34)      # rock arch silhouette
-GOLD     = (238, 178, 92)
+CREAM = (250, 238, 214)
+GOLD = (238, 178, 92)
 
 random.seed(20261121)
 
+# --- pixel buffer -------------------------------------------------------
+buf = bytearray(W * H * 3)
+
+
+def set_px(x, y, col):
+    if 0 <= x < W and 0 <= y < H:
+        i = (y * W + x) * 3
+        buf[i] = col[0]
+        buf[i + 1] = col[1]
+        buf[i + 2] = col[2]
+
+
+def blend_px(x, y, col, a):
+    """Alpha-blend col over the pixel (a: 0..255)."""
+    if 0 <= x < W and 0 <= y < H and a > 0:
+        i = (y * W + x) * 3
+        inv = 255 - a
+        buf[i] = (col[0] * a + buf[i] * inv) // 255
+        buf[i + 1] = (col[1] * a + buf[i + 1] * inv) // 255
+        buf[i + 2] = (col[2] * a + buf[i + 2] * inv) // 255
+
 
 def lerp(a, b, t):
-    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+    return (int(a[0] + (b[0] - a[0]) * t),
+            int(a[1] + (b[1] - a[1]) * t),
+            int(a[2] + (b[2] - a[2]) * t))
 
 
-def vertical_gradient(size, stops):
-    """stops: list of (position 0..1, colour). Returns an RGB image."""
-    w, h = size
-    img = Image.new("RGB", (w, h))
-    px = img.load()
-    for y in range(h):
-        t = y / max(h - 1, 1)
+def fill_circle(cx, cy, r, col, alpha=255):
+    r2 = r * r
+    for y in range(int(cy - r), int(cy + r) + 1):
+        dy = y - cy
+        dx = int(math.sqrt(max(r2 - dy * dy, 0)))
+        for x in range(int(cx - dx), int(cx + dx) + 1):
+            if alpha >= 255:
+                set_px(x, y, col)
+            else:
+                blend_px(x, y, col, alpha)
+
+
+def fill_poly(points, col):
+    """Scanline fill of a simple polygon (list of (x, y))."""
+    if not points:
+        return
+    ys = [p[1] for p in points]
+    y0, y1 = int(min(ys)), int(max(ys))
+    n = len(points)
+    for y in range(y0, y1 + 1):
+        xs = []
+        for i in range(n):
+            x0, ya = points[i]
+            x1, yb = points[(i + 1) % n]
+            if ya == yb:
+                continue
+            if (ya <= y < yb) or (yb <= y < ya):
+                xs.append(x0 + (y - ya) * (x1 - x0) / (yb - ya))
+        xs.sort()
+        for i in range(0, len(xs) - 1, 2):
+            for x in range(int(xs[i]), int(xs[i + 1]) + 1):
+                set_px(x, y, col)
+
+
+def hline(x0, x1, y, col, alpha=255):
+    for x in range(int(x0), int(x1) + 1):
+        if alpha >= 255:
+            set_px(x, y, col)
+        else:
+            blend_px(x, y, col, alpha)
+
+
+# --- 5x7 bitmap font (only the letters VELMARA needs) -------------------
+GLYPHS = {
+    "V": ["#   #", "#   #", "#   #", "#   #", "#   #", " # # ", "  #  "],
+    "E": ["#####", "#    ", "#    ", "#### ", "#    ", "#    ", "#####"],
+    "L": ["#    ", "#    ", "#    ", "#    ", "#    ", "#    ", "#####"],
+    "M": ["#   #", "## ##", "# # #", "# # #", "#   #", "#   #", "#   #"],
+    "A": [" ### ", "#   #", "#   #", "#####", "#   #", "#   #", "#   #"],
+    "R": ["#### ", "#   #", "#   #", "#### ", "# #  ", "#  # ", "#   #"],
+}
+
+
+def draw_text(text, x0, y0, scale, col):
+    x = x0
+    for ch in text:
+        g = GLYPHS.get(ch)
+        if g is None:
+            x += 6 * scale
+            continue
+        for row in range(7):
+            for c in range(5):
+                if g[row][c] == "#":
+                    for dy in range(scale):
+                        for dx in range(scale):
+                            set_px(x + c * scale + dx, y0 + row * scale + dy, col)
+        x += 6 * scale
+
+
+def text_width(text, scale):
+    return len(text) * 6 * scale - scale
+
+
+# --- PNG encoder (stdlib only) ------------------------------------------
+def png_chunk(typ, data):
+    out = struct.pack(">I", len(data)) + typ + data
+    out += struct.pack(">I", binascii.crc32(typ + data) & 0xFFFFFFFF)
+    return out
+
+
+def write_png(path, width, height, rgb):
+    raw = bytearray()
+    stride = width * 3
+    for y in range(height):
+        raw.append(0)  # filter: none
+        raw += rgb[y * stride:(y + 1) * stride]
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    data = b"\x89PNG\r\n\x1a\n"
+    data += png_chunk(b"IHDR", ihdr)
+    data += png_chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+    data += png_chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(data)
+    return len(data)
+
+
+# --- the poster ----------------------------------------------------------
+def main():
+    horizon = 640
+    # sky gradient (per row)
+    stops = [(0.0, SKY_TOP), (0.38, SKY_MID), (0.55, DUSK),
+             (0.62, EMBER), (0.625, SEA_DEEP)]
+    for y in range(H):
+        t = y / (H - 1)
+        col = stops[-1][1]
         for i in range(len(stops) - 1):
             p0, c0 = stops[i]
             p1, c1 = stops[i + 1]
@@ -57,228 +181,83 @@ def vertical_gradient(size, stops):
                 f = 0 if p1 == p0 else (t - p0) / (p1 - p0)
                 col = lerp(c0, c1, f)
                 break
-        else:
-            col = stops[-1][1]
-        for x in range(w):
-            px[x, y] = col
-    return img
+        for x in range(W):
+            set_px(x, y, col)
 
-
-def draw_stars(draw, n=140):
-    for _ in range(n):
+    # stars
+    for _ in range(150):
         x = random.uniform(0, W)
         y = random.uniform(0, H * 0.42)
-        r = random.uniform(0.6, 1.8)
+        r = random.uniform(0.6, 1.7)
         a = random.randint(90, 230)
-        # brighter stars higher up
         if y < H * 0.18 and random.random() < 0.25:
             r = random.uniform(1.6, 2.4)
             a = 255
-        draw.ellipse([x - r, y - r, x + r, y + r], fill=(255, 244, 220, a))
+        fill_circle(x, y, r, (255, 244, 220), a)
 
-
-def draw_moon(base):
-    """Moon with a soft halo, drawn on its own layer and blurred."""
-    layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
+    # moon halo + disc (centre 512, 470, radius 118)
     cx, cy, r = 512, 470, 118
-    # halo
-    d.ellipse([cx - r * 1.9, cy - r * 1.9, cx + r * 1.9, cy + r * 1.9],
-              fill=(250, 210, 130, 46))
-    d.ellipse([cx - r * 1.35, cy - r * 1.35, cx + r * 1.35, cy + r * 1.35],
-              fill=(250, 214, 140, 70))
-    halo = layer.filter(ImageFilter.GaussianBlur(28))
-    base.alpha_composite(halo)
-    # disc
-    d2 = ImageDraw.Draw(base)
-    d2.ellipse([cx - r, cy - r, cx + r, cy + r], fill=MOON + (255,))
-    d2.ellipse([cx - r * 0.82, cy - r * 0.82, cx + r * 0.82, cy + r * 0.82],
-               fill=MOON_CORE + (255,))
-    # a few soft maria (darker patches, low alpha) — placed asymmetric so
-    # they read as lunar seas, never as a face
+    fill_circle(cx, cy, r * 1.9, (250, 210, 130), 18)
+    fill_circle(cx, cy, r * 1.35, (250, 214, 140), 30)
+    fill_circle(cx, cy, r, MOON)
+    fill_circle(cx, cy, r * 0.82, MOON_CORE)
+    # maria: asymmetric, never a face
     for (mx, my, mr) in [(-58, 6, 22), (44, -38, 17), (18, 52, 14),
                          (-12, -58, 12), (62, 30, 10)]:
-        d2.ellipse([cx + mx - mr, cy + my - mr, cx + mx + mr, cy + my + mr],
-                   fill=(226, 196, 138, 90))
+        fill_circle(cx + mx, cy + my, mr, (226, 196, 138), 90)
 
-
-def draw_arch(draw):
-    """Natural stone arch silhouette on the right, framing the moon."""
-    # A leaning arch: two pillars + a curved top, drawn as a thick arc band.
-    # Outer arc and inner arc (the opening) share a centre below the horizon.
-    cx, cy = 830, 640
-    outer = 330
-    inner = 235
-    # pillars down to the sea
-    draw.polygon([(cx - outer, cy), (cx - outer + 64, cy),
-                  (cx - outer + 88, 640), (cx - outer - 8, 640)], fill=ARCH)
-    draw.polygon([(cx + outer - 64, cy), (cx + outer, cy),
-                  (cx + outer + 8, 640), (cx + outer - 88, 640)], fill=ARCH)
-    # arch band: draw a thick arc by stamping circles along the arc
-    for ang in range(180, 361, 2):
-        rad = math.radians(ang)
-        x = cx + outer * math.cos(rad)
-        y = cy - outer * math.sin(rad) * 0.92
-        draw.ellipse([x - 34, y - 34, x + 34, y + 34], fill=ARCH)
-    # carve the opening (sea + sky show through)
-    for ang in range(180, 361, 2):
-        rad = math.radians(ang)
-        x = cx + inner * math.cos(rad)
-        y = cy - inner * math.sin(rad) * 0.92
-        draw.ellipse([x - 30, y - 30, x + 30, y + 30], fill=(0, 0, 0, 0))
-    # The carve above uses transparent fill which does not erase on RGBA
-    # overlay; instead we redraw the opening by compositing a cut layer.
-    return (cx, cy, outer, inner)
-
-
-def draw_sea(base):
-    """Sea with the moon's gold light path."""
-    sea = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(sea)
-    horizon = 640
-    # sea body: vertical gradient
+    # sea: gradient + horizon glow + light path
     for y in range(horizon, H):
         t = (y - horizon) / (H - horizon)
         col = lerp(SEA_LIT, SEA_DEEP, t)
-        d.line([(0, y), (W, y)], fill=col + (255,))
-    # horizon glow line
-    d.line([(0, horizon), (W, horizon)], fill=(250, 200, 130, 160), width=2)
-    # light path: shimmering horizontal dashes under the moon, widening down
+        for x in range(W):
+            set_px(x, y, col)
+    hline(0, W - 1, horizon, (250, 200, 130), 160)
     for y in range(horizon + 8, H - 6, 7):
         t = (y - horizon) / (H - horizon)
         half = 26 + t * 150
-        cx = 512 + random.uniform(-6, 6)
-        # a few dashes per row
-        n = random.randint(2, 4)
-        for _ in range(n):
+        ccx = 512 + random.uniform(-6, 6)
+        for _ in range(random.randint(2, 4)):
             off = random.uniform(-half, half)
             w = random.uniform(14, 52) * (0.5 + t)
             a = random.randint(60, 170)
-            x0 = cx + off - w / 2
-            x1 = cx + off + w / 2
-            d.line([(x0, y), (x1, y)], fill=(250, 206, 130, a), width=3)
-    base.alpha_composite(sea)
+            hline(ccx + off - w / 2, ccx + off + w / 2, y,
+                  (250, 206, 130), a)
 
+    # small rocky islet under the moon (the arch's top, kept as an island)
+    fill_circle(512, 652, 26, (8, 8, 20))
 
-def draw_boat(draw):
-    """One small sailboat silhouette on the light path."""
+    # foreground headlands, bottom corners
+    fill_poly([(0, H), (0, 968), (180, 930), (330, 962), (300, H)], (8, 8, 20))
+    fill_poly([(W, H), (W, 972), (880, 940), (760, 966), (720, H)], (8, 8, 20))
+
+    # sailboat on the light path
     bx, by = 512, 792
-    # hull
-    draw.polygon([(bx - 34, by), (bx + 34, by), (bx + 22, by + 14),
-                  (bx - 22, by + 14)], fill=(8, 8, 22))
-    # mast
-    draw.line([(bx, by), (bx, by - 62)], fill=(8, 8, 22), width=4)
-    # sails (pale, catching the moon)
-    draw.polygon([(bx + 3, by - 58), (bx + 3, by - 6), (bx + 30, by - 6)],
-                 fill=(250, 232, 200))
-    draw.polygon([(bx - 3, by - 48), (bx - 3, by - 6), (bx - 24, by - 6)],
-                 fill=(232, 206, 168))
-    # reflection
-    draw.line([(bx - 20, by + 20), (bx + 20, by + 20)], fill=(250, 206, 130, 120), width=2)
+    fill_poly([(bx - 34, by), (bx + 34, by), (bx + 22, by + 14),
+               (bx - 22, by + 14)], (8, 8, 22))
+    for y in range(by - 62, by + 1):
+        set_px(bx, y, (8, 8, 22))
+    fill_poly([(bx + 3, by - 58), (bx + 3, by - 6), (bx + 30, by - 6)],
+              (250, 232, 200))
+    fill_poly([(bx - 3, by - 48), (bx - 3, by - 6), (bx - 24, by - 6)],
+              (232, 206, 168))
+    hline(bx - 20, bx + 20, by + 20, (250, 206, 130), 120)
 
-
-def draw_name(draw):
-    """The place name — the only text. Large, legible, upper sky."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join(here, "fonts", "BigShoulders-Bold.ttf"),
-        os.path.join(here, "BigShoulders-Bold.ttf"),
-    ]
-    font = None
-    for path in candidates:
-        if os.path.exists(path):
-            try:
-                font = ImageFont.truetype(path, 148)
-                break
-            except Exception:
-                pass
-    if font is None:
-        font = ImageFont.load_default()
+    # the name — the only text. Large, legible, upper sky.
+    scale = 20
     name = "VELMARA"
-    # letter-spacing: draw letter by letter for a wide, poster feel
-    spacing = 26
-    widths = []
-    total = 0
-    for ch in name:
-        bbox = draw.textbbox((0, 0), ch, font=font)
-        w = bbox[2] - bbox[0]
-        widths.append(w)
-        total += w
-    total += spacing * (len(name) - 1)
-    x = (W - total) // 2
-    y = 96
-    # soft shadow for legibility against the sky
-    for ch, w in zip(name, widths):
-        draw.text((x + 3, y + 5), ch, font=font, fill=(10, 8, 26))
-        x += w + spacing
-    x = (W - total) // 2
-    for ch, w in zip(name, widths):
-        draw.text((x, y), ch, font=font, fill=CREAM)
-        x += w + spacing
+    tw = text_width(name, scale)
+    x0 = (W - tw) // 2
+    y0 = 96
+    draw_text(name, x0 + 4, y0 + 6, scale, (10, 8, 26))  # shadow
+    draw_text(name, x0, y0, scale, CREAM)
     # thin gold rule under the name
-    rule_y = y + 168
-    draw.line([(W // 2 - 90, rule_y), (W // 2 + 90, rule_y)],
-              fill=GOLD + (255,), width=3)
+    for y in range(y0 + 7 * scale + 22, y0 + 7 * scale + 25):
+        hline(W // 2 - 90, W // 2 + 90, y, GOLD)
 
-
-def main():
-    # sky
-    img = vertical_gradient((W, H), [
-        (0.0, SKY_TOP), (0.38, SKY_MID), (0.55, DUSK),
-        (0.62, EMBER), (0.625, SEA_DEEP),
-    ]).convert("RGBA")
-    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(overlay)
-    draw_stars(d)
-    img.alpha_composite(overlay)
-
-    draw_moon(img)
-
-    # arch: draw on a layer, then cut the opening with a mask
-    arch_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ad = ImageDraw.Draw(arch_layer)
-    draw_arch(ad)
-    # cut the opening: erase an inner arch-shaped region
-    mask = Image.new("L", (W, H), 0)
-    md = ImageDraw.Draw(mask)
-    cx, cy, outer, inner = 830, 640, 330, 235
-    for ang in range(180, 361, 2):
-        rad = math.radians(ang)
-        x = cx + inner * math.cos(rad)
-        y = cy - inner * math.sin(rad) * 0.92
-        md.ellipse([x - 30, y - 30, x + 30, y + 30], fill=255)
-    # also clear below the inner arch down to the horizon (the opening)
-    md.polygon([(cx - inner, cy), (cx + inner, cy),
-                (cx + inner, 640), (cx - inner, 640)], fill=255)
-    arch_layer.putalpha(Image.composite(
-        Image.new("L", (W, H), 0), arch_layer.split()[3], mask))
-    img.alpha_composite(arch_layer)
-
-    draw_sea(img)
-
-    # foreground silhouette: low headland at the bottom corners
-    fd = ImageDraw.Draw(img)
-    fd.polygon([(0, H), (0, 968), (180, 930), (330, 962), (300, H)], fill=(8, 8, 20))
-    fd.polygon([(W, H), (W, 972), (880, 940), (760, 966), (720, H)], fill=(8, 8, 20))
-
-    draw_boat(fd)
-    draw_name(fd)
-
-    # gentle vignette
-    vig = Image.new("L", (W, H), 0)
-    vd = ImageDraw.Draw(vig)
-    vd.ellipse([-220, -220, W + 220, H + 220], fill=255)
-    vig = vig.filter(ImageFilter.GaussianBlur(180))
-    black = Image.new("RGBA", (W, H), (0, 0, 0, 255))
-    img = Image.composite(img, Image.composite(img, black, vig), vig)
-    # simpler: darken edges by compositing black with inverted vignette
-    inv = Image.new("L", (W, H), 0)
-    # (vignette already soft; keep the image as is)
-
-    out = img.convert("RGB")
     os.makedirs(os.path.dirname(OUT) or ".", exist_ok=True)
-    out.save(OUT, "PNG", optimize=True)
-    print("wrote", OUT, os.path.getsize(OUT), "bytes")
+    n = write_png(OUT, W, H, buf)
+    print("wrote", OUT, n, "bytes")
 
 
 if __name__ == "__main__":
