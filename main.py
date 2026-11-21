@@ -94,8 +94,10 @@ def draw_moon(base):
     d2.ellipse([cx - r, cy - r, cx + r, cy + r], fill=MOON + (255,))
     d2.ellipse([cx - r * 0.82, cy - r * 0.82, cx + r * 0.82, cy + r * 0.82],
                fill=MOON_CORE + (255,))
-    # a few soft maria (darker patches, low alpha)
-    for (mx, my, mr) in [(-38, -22, 26), (30, 18, 20), (6, -52, 16), (-8, 48, 14)]:
+    # a few soft maria (darker patches, low alpha) — placed asymmetric so
+    # they read as lunar seas, never as a face
+    for (mx, my, mr) in [(-58, 6, 22), (44, -38, 17), (18, 52, 14),
+                         (-12, -58, 12), (62, 30, 10)]:
         d2.ellipse([cx + mx - mr, cy + my - mr, cx + mx + mr, cy + my + mr],
                    fill=(226, 196, 138, 90))
 
